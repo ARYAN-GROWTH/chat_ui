@@ -39,9 +39,9 @@ async def lifespan(app: FastAPI):
 #  FastAPI Application Setup
 
 app = FastAPI(
-    title="Diamond Chat — WebSocket AI Chat",
+    title=" Chat APP— AI Powered",
     version="1.0.0",
-    description="""💎 Diamond Chat API — FastAPI backend for NL → SQL chatbot with real-time streaming.""",
+    description="""Chat APP.""",
     lifespan=lifespan,
 )
 
@@ -57,7 +57,7 @@ app.add_middleware(
 )
 
 
-# 🧩 Session Middleware
+#  Session Middleware
 
 class SessionMiddleware(BaseHTTPMiddleware):
     """Generate session_id per page refresh."""
@@ -102,7 +102,7 @@ async def root(request: Request):
     """Root endpoint showing session info."""
     return {
         "success": True,
-        "message": "Diamond Chat API is running 🚀",
+        "message": "Chat API is running ",
         "session_id": request.state.session_id,
         "websocket": "/ws/query",
     }
