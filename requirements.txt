@@ -1,0 +1,15 @@
+fastapi
+uvicorn[standard]
+sqlalchemy[asyncio]
+asyncpg
+python-dotenv
+pydantic
+pydantic-settings
+loguru
+openai
+markdown2
+sqlparse
+aiofiles
+pandas
+openpyxl
+websockets
