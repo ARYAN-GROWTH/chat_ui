@@ -24,89 +24,94 @@ class QueryService:
         self.sql_agent = SQLAgent(session_id=session_id)
         self.summarizer = ResultSummarizer(session_id=f"{session_id}_summ")
         self.schema_inspector = SchemaInspector(session)
-        #  Use cached schema context (loaded once at app startup)
         self.schema_context = SchemaInspector._cached_schema_text or ""
 
-    #  Main Intelligent Pipeline (Intent-Aware + Smart Output)
- 
+    
+    #  Main Stream Process (Intent Detection + SQL Execution)
+    
     async def stream_process(self, user_query: str) -> AsyncGenerator[Dict, None]:
-        """
-        Handles both conversational and SQL-based queries intelligently.
-        - Detects intent (CHAT / SQL_QUERY / OTHER)
-        - For CHAT → conversational reply
-        - For SQL_QUERY → executes query + generates Excel + summary
-        """
         start_time = time.time()
         sql = ""
 
         try:
-            # 1️ Save user message
+            #  Save user message
             await self._save_chat_message("user", user_query)
 
-            # 2️ Detect user intent
+            # Detect intent
             yield {"event": "status", "message": " Understanding your intent..."}
             intent = await self._detect_intent(user_query)
             logger.info(f" Detected intent: {intent}")
 
-
-            #  Chat / Small Talk Intent
-
+            
+            #  CHAT Intent
+            
             if intent == "CHAT":
                 yield {"event": "status", "message": " Generating conversational reply..."}
-                response = await self.summarizer.generate_chat_reply(user_query)
-                if not response or response.strip() == "":
+
+                try:
+                    logger.debug(" Calling summarizer.generate_chat_reply()...")
+                    response = await self.summarizer.generate_chat_reply(user_query)
+                except Exception as e:
+                    logger.error(f" Summarizer chat reply error: {e}")
+                    response = None
+
+                # Fallback message if summarizer fails
+                if not response or not isinstance(response, str) or response.strip() == "":
                     response = "Hey there! How can I assist you with your data today?"
 
                 await self._save_chat_message("assistant", response)
-                yield {"event": "chat_reply", "message": response, "session_id": self.session_id}
+                yield {"event": "chat_reply", "message": response}
+                logger.info(f"Yielded chat reply: {response}")
+
                 exec_time_ms = int((time.time() - start_time) * 1000)
                 await self._log_query(user_query, None, "valid", "success", None, 0, exec_time_ms)
                 return
 
-       
-            #  Unclear / Unsupported Intent
-
+          
+            #  OTHER Intent
+           
             if intent == "OTHER":
                 reply = " I couldn’t understand that clearly. Could you please rephrase or ask about your data?"
                 await self._save_chat_message("assistant", reply)
-                yield {"event": "chat_reply", "message": reply, "session_id": self.session_id}
+                yield {"event": "chat_reply", "message": reply}
                 return
 
-  
-            #  SQL Query Intent
+           
+            #  SQL_QUERY Intent
+           
+            yield {"event": "status", "message": "Generating SQL query from your request..."}
 
-            yield {"event": "status", "message": " Generating SQL query from your request..."}
-
-            #  Use cached schema instead of re-fetching each time
             schema_info = self.schema_context or await self.schema_inspector.get_schema_description()
 
+            # Stream SQL generation
             async for piece in self.sql_agent.stream_generate_sql(user_query):
                 if isinstance(piece, str):
                     yield {"event": "sql_token", "chunk": piece}
                     sql += piece
                 elif isinstance(piece, dict) and piece.get("__final_sql__"):
                     sql = piece["__final_sql__"]
-                    yield {"event": "sql", "sql": sql}
+                    yield {"event": "sql", "sql": sql or ""}
 
             if not sql.strip():
-                yield {"event": "error", "message": "No valid SQL generated."}
+                yield {"event": "error", "message": " No valid SQL generated."}
                 return
 
             # Validate SQL
             valid, fixed_sql, error = self.sql_agent.validate_and_fix_sql(sql)
             if not valid:
                 await self._log_query(user_query, sql, "invalid", "failed", error)
-                yield {"event": "error", "message": error}
+                yield {"event": "error", "message": error or "Invalid SQL syntax."}
                 return
 
             yield {"event": "status", "message": " Executing SQL query on the database..."}
 
+            # Execute SQL (no limit)
             result = await self.session.execute(text(fixed_sql))
             rows = result.fetchall()
             columns = list(result.keys())
 
             if not rows:
-                yield {"event": "error", "message": "No records found for this query."}
+                yield {"event": "error", "message": " No records found for this query."}
                 return
 
             rows_list = [list(r) for r in rows]
@@ -115,7 +120,7 @@ class QueryService:
             df.columns = [str(c).strip() for c in df.columns]
             total_rows = len(df)
 
-            #  Excel Export + HTML Preview
+            # Excel Export + HTML Preview
             file_name = await self._export_to_excel(df)
             preview_html = self._generate_preview_html(df, total_rows, file_name)
 
@@ -125,18 +130,15 @@ class QueryService:
                     "columns": columns,
                     "preview_html": preview_html,
                     "row_count": total_rows,
-                    "file_name": file_name
+                    "file_name": file_name,
                 },
             }
 
-            #  AI Summary Generation
+            # AI Summary
             yield {"event": "status", "message": " Generating AI summary..."}
 
             rows_tuples = [tuple(r) for r in rows]
-            summary_text = await self.summarizer.summarize(
-                user_query, fixed_sql, columns, rows_tuples, total_rows
-            )
-
+            summary_text = await self.summarizer.summarize(user_query, fixed_sql, columns, rows_tuples, total_rows)
             summary_text = summary_text or f" Query executed successfully with {total_rows} rows."
 
             await self._save_chat_message("assistant", summary_text)
@@ -145,6 +147,7 @@ class QueryService:
             exec_time_ms = int((time.time() - start_time) * 1000)
             await self._log_query(user_query, fixed_sql, "valid", "success", None, total_rows, exec_time_ms)
 
+            # Final event
             yield {
                 "event": "complete",
                 "data": {
@@ -152,26 +155,35 @@ class QueryService:
                     "execution_time_ms": exec_time_ms,
                     "row_count": total_rows,
                     "sql": fixed_sql,
-                    "download_url": f"/downloads/{file_name}"
+                    "download_url": f"/downloads/{file_name}",
                 },
             }
 
         except Exception as e:
-            logger.error(f"Stream process error: {e}")
-            await self._log_query(user_query, sql or "", "error", "failed", str(e))
+            logger.error(f" Stream process error: {e}")
+            try:
+                await self._log_query(user_query if 'user_query' in locals() else '',
+                                      sql if 'sql' in locals() else '',
+                                      "error", "failed", str(e))
+            except Exception as inner:
+                logger.error(f" Failed to log query error: {inner}")
             yield {"event": "error", "message": str(e)}
 
 
     #  Intent Detection
-
+    
     async def _detect_intent(self, query: str) -> str:
-        """Detect user intent using rules + fallback LLM."""
         q_lower = query.lower().strip()
-        smalltalk_triggers = ["hi", "hello", "hey", "thanks", "good morning", "good evening", "who are you", "how are you"]
+
+        smalltalk_triggers = [
+            "hi", "hello", "hey", "thanks", "good morning",
+            "good evening", "who are you", "how are you"
+        ]
         sql_triggers = [
             "show", "list", "give me", "find", "fetch", "get", "select",
             "count", "total", "average", "sum", "highest", "lowest",
-            "details", "data", "customer", "product", "sales", "item", "price", "report", "what",
+            "details", "data", "customer", "product", "sales", "item", "price",
+            "report", "what", "range", "tell me"
         ]
 
         if any(t in q_lower for t in smalltalk_triggers):
@@ -179,13 +191,12 @@ class QueryService:
         if any(t in q_lower for t in sql_triggers):
             return "SQL_QUERY"
 
-        prompt = f"""
-        Classify this message into one of: SQL_QUERY, CHAT, OTHER
-        Message: "{query}"
-        Respond with one word only.
-        """
         try:
-            result = await self.sql_agent.simple_classify_intent(prompt)
+            result = await self.sql_agent.simple_classify_intent(f"""
+            Classify this message into one of: SQL_QUERY, CHAT, OTHER
+            Message: "{query}"
+            Respond with one word only.
+            """)
             result = (result or "").strip().upper()
             if "SQL" in result:
                 return "SQL_QUERY"
@@ -195,9 +206,9 @@ class QueryService:
         except Exception:
             return "OTHER"
 
-
-    #  Excel Export + Preview HTML
-
+   
+    #  Excel Export + HTML Preview
+   
     async def _export_to_excel(self, df: pd.DataFrame) -> str:
         exports_dir = Path("exports")
         exports_dir.mkdir(exist_ok=True)
@@ -241,15 +252,15 @@ class QueryService:
             <div style="margin-top:10px; text-align:center;">
                 <button onclick="window.open('/downloads/{file_name}', '_blank')" 
                         style="background-color:#0078D4; color:white; padding:8px 15px; border:none; border-radius:6px; cursor:pointer;">
-                    ⬇ Download Excel (.xlsx)
+                    Download Excel (.xlsx)
                 </button>
             </div>
         </div>
         """
 
+   
+    #  Logging + History
 
-    #  Logging + Memory Helpers
- 
     async def _save_chat_message(self, role: str, content: str):
         message_id = str(uuid.uuid4())
         await self.session.execute(
@@ -293,6 +304,38 @@ class QueryService:
             },
         )
         await self.session.commit()
+
+    async def get_chat_history(self, limit: int = 50):
+        try:
+            result = await self.session.execute(
+                text("""
+                    SELECT role, content
+                    FROM public.chat_history
+                    WHERE session_id = :sid
+                    ORDER BY created_at DESC
+                    LIMIT :limit
+                """),
+                {"sid": self.session_id, "limit": limit}
+            )
+            rows = result.mappings().all()
+            history = [{"role": r["role"], "content": r["content"]} for r in rows]
+            return list(reversed(history))
+        except Exception as e:
+            logger.error(f"Error fetching chat history: {e}")
+            return []
+
+    async def clear_history(self):
+        try:
+            await self.session.execute(
+                text("DELETE FROM public.chat_history WHERE session_id = :sid"),
+                {"sid": self.session_id},
+            )
+            await self.session.commit()
+            logger.info(f" Cleared chat history for session: {self.session_id}")
+            return True
+        except Exception as e:
+            logger.error(f" Error clearing chat history: {e}")
+            return False
 
 
 

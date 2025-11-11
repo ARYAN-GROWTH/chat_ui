@@ -12,6 +12,8 @@ router = APIRouter(prefix="/ws", tags=["WebSocket"])
 logger = get_logger(__name__)
 
 
+#  Helper: Ensure session exists in DB
+
 async def ensure_session_in_db(db: AsyncSession, session_id: str):
     """
     Inserts or updates a session record in the sessions table.
@@ -27,31 +29,80 @@ async def ensure_session_in_db(db: AsyncSession, session_id: str):
         {"sid": session_id},
     )
     await db.commit()
-    logger.debug(f" Verified session in DB: {session_id}")
+    logger.debug(f"Verified session in DB: {session_id}")
 
 
+
+# Helper: Standard WebSocket Response Formatter
+
+def format_ws_response(event: dict, session_id: str, message_id: str) -> dict:
+    """
+    Formats all WebSocket responses into a unified structure
+    consistent with the standard APIResponse format.
+    """
+    base = {
+        "success": True,
+        "event": event.get("event"),  #  moved to top-level for frontend compatibility
+        "message": None,
+        "data": {},
+        "error": None,
+        "pagination": None,
+        "session_id": session_id,
+        "message_id": message_id,
+    }
+
+    # Copy message if available
+    if "message" in event:
+        base["message"] = event["message"]
+
+    # Merge any 'data' dicts directly
+    if "data" in event and isinstance(event["data"], dict):
+        base["data"].update(event["data"])
+
+    # Handle error events gracefully
+    if event.get("event") == "error":
+        base["success"] = False
+        base["error"] = event.get("message", "Unknown error")
+        if not base["message"]:
+            base["message"] = " An error occurred while processing your query."
+
+    # Copy other dynamic keys like 'chunk', 'sql', etc.
+    for k, v in event.items():
+        if k not in ["event", "message", "data"]:
+            base["data"][k] = v
+
+    # Default message if missing
+    if not base["message"]:
+        base["message"] = f"Event: {event.get('event', 'unknown')}"
+
+    return base
+
+
+
+#  Main WebSocket Endpoint — Real-time Query Processing
 
 @router.websocket("/query")
 async def websocket_query(websocket: WebSocket, db: AsyncSession = Depends(get_db)):
     """
     Handles Diamond Chat real-time communication via WebSocket.
     Steps:
-      1. Accept connection and parse handshake
-      2. Create or resume session
-      3. Stream query processing via QueryService
-      4. Stream structured HTML results + summary
+      1 Accept connection and parse handshake
+      2 Create or resume session
+      3 Stream query processing via QueryService
+      4 Send unified responses (success, message, data, error, pagination)
     """
     await websocket.accept()
     logger.info(" WebSocket connection accepted")
 
     try:
-
+        # Step  — Initial handshake
         init_msg = await websocket.receive_text()
         try:
             init_data = json.loads(init_msg)
         except json.JSONDecodeError:
             await websocket.send_json({
                 "success": False,
+                "event": "error",
                 "message": "Invalid JSON in initial handshake.",
                 "data": {},
                 "error": True,
@@ -60,26 +111,24 @@ async def websocket_query(websocket: WebSocket, db: AsyncSession = Depends(get_d
             await websocket.close()
             return
 
-
+        # Step 2️ — Create or resume session
         session_id = init_data.get("session_id") or str(uuid.uuid4())
         await ensure_session_in_db(db, session_id)
 
         event_type = "session_resumed" if "session_id" in init_data else "session_created"
-        message = " Session resumed" if "session_id" in init_data else " New session created"
-        await websocket.send_json({
+        message = "Session resumed" if "session_id" in init_data else "New session created"
+
+        await websocket.send_json(format_ws_response({
             "event": event_type,
-            "success": True,
-            "session_id": session_id,
             "message": message,
-            "data": {},
-            "error": None,
-            "pagination": None
-        })
+        }, session_id, "init"))
+
         logger.info(f"[WS] {message}: {session_id}")
 
-
+        # Step 3️ — Initialize QueryService
         service = QueryService(db, session_id=session_id)
 
+        # Step 4️ — Main message loop
         while True:
             try:
                 raw_message = await websocket.receive_text()
@@ -87,89 +136,52 @@ async def websocket_query(websocket: WebSocket, db: AsyncSession = Depends(get_d
                     payload = json.loads(raw_message)
                     user_query = payload.get("query", "").strip()
                 except json.JSONDecodeError:
-                    await websocket.send_json({
+                    await websocket.send_json(format_ws_response({
                         "event": "error",
-                        "success": False,
-                        "message": "Invalid JSON payload in query.",
-                        "data": {},
-                        "error": True,
-                        "pagination": None
-                    })
+                        "message": "Invalid JSON payload in query."
+                    }, session_id, "parse-error"))
                     continue
 
                 if not user_query:
-                    await websocket.send_json({
+                    await websocket.send_json(format_ws_response({
                         "event": "error",
-                        "success": False,
-                        "message": "Query cannot be empty.",
-                        "data": {},
-                        "error": True,
-                        "pagination": None
-                    })
+                        "message": "Query cannot be empty."
+                    }, session_id, "empty-query"))
                     continue
 
                 message_id = str(uuid.uuid4())
-                logger.info(f"[WS]  session={session_id}, message={message_id}, query='{user_query}'")
+                logger.info(f"[WS] session={session_id}, message={message_id}, query='{user_query}'")
 
-                # Notify client that processing has started
-                await websocket.send_json({
+                # Notify client query processing started
+                await websocket.send_json(format_ws_response({
                     "event": "status",
-                    "success": True,
-                    "message": " Processing query...",
-                    "session_id": session_id,
-                    "message_id": message_id,
-                    "data": {},
-                    "error": None,
-                    "pagination": None
-                })
+                    "message": "Processing query..."
+                }, session_id, message_id))
 
-
+                # Stream results from QueryService
                 async for event in service.stream_process(user_query):
-                    # Attach identifiers
-                    event["session_id"] = session_id
-                    event["message_id"] = message_id
+                    formatted = format_ws_response(event, session_id, message_id)
+                    await websocket.send_json(formatted)
+                    logger.debug(f"[WS -> Client] Sent event: {formatted.get('event')}")
 
-                    # Ensure consistent JSON envelope
-                    await websocket.send_json({
-                        "success": True if event.get("event") != "error" else False,
-                        "message": event.get("message", ""),
-                        "data": event.get("data", {}),
-                        "event": event.get("event"),
-                        "session_id": session_id,
-                        "message_id": message_id,
-                        "error": True if event.get("event") == "error" else None,
-                        "pagination": None
-                    })
-
-                await websocket.send_json({
+                # Send final completion event
+                await websocket.send_json(format_ws_response({
                     "event": "complete",
-                    "success": True,
-                    "message": " Query execution completed.",
-                    "session_id": session_id,
-                    "message_id": message_id,
-                    "data": {},
-                    "error": None,
-                    "pagination": None
-                })
+                    "message": "Query execution completed."
+                }, session_id, message_id))
 
                 await ensure_session_in_db(db, session_id)
-
 
             except WebSocketDisconnect:
                 logger.info(f"[WS] 🔌 Disconnected — session={session_id}")
                 break
 
             except Exception as e:
-                logger.error(f"[WS]  Query processing error: {e}")
-                await websocket.send_json({
+                logger.error(f"[WS] Query processing error: {e}")
+                await websocket.send_json(format_ws_response({
                     "event": "error",
-                    "success": False,
-                    "message": str(e),
-                    "session_id": session_id,
-                    "data": {},
-                    "error": True,
-                    "pagination": None
-                })
+                    "message": str(e)
+                }, session_id, "query-error"))
                 await ensure_session_in_db(db, session_id)
 
     except WebSocketDisconnect:
@@ -177,15 +189,10 @@ async def websocket_query(websocket: WebSocket, db: AsyncSession = Depends(get_d
     except Exception as e:
         logger.error(f" Fatal WebSocket error: {e}")
         try:
-            await websocket.send_json({
+            await websocket.send_json(format_ws_response({
                 "event": "error",
-                "success": False,
-                "message": str(e),
-                "session_id": "unknown",
-                "data": {},
-                "error": True,
-                "pagination": None
-            })
+                "message": str(e)
+            }, "unknown", "fatal"))
         except Exception:
             pass
     finally:

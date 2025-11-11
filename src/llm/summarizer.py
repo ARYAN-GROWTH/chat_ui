@@ -1,3 +1,4 @@
+import asyncio
 from src.llm.provider import LLMProvider
 from src.core.logging import get_logger
 from src.db.schema_inspect import SchemaInspector
@@ -10,7 +11,6 @@ logger = get_logger(__name__)
 
 class ResultSummarizer:
     def __init__(self, session_id: str = "summarizer"):
-        
         schema_context = SchemaInspector._cached_schema_text or "(schema not loaded)"
         self.llm_provider = LLMProvider(
             system_message=f"""
@@ -28,13 +28,15 @@ Rules:
 5. If the data looks repetitive or limited, say that clearly.
 """
         )
+        self.session_id = session_id
 
-    #  Core: SQL + Data Summarization (Schema-aware)
 
+    #  SQL + Data Summarization
+  
     async def summarize(
         self, user_query: str, sql: str, columns: List[str], rows: List[tuple], total_rows: int
     ) -> str:
-        """Summarizes SQL query results (structured tabular data) into natural language."""
+        """Summarizes SQL query results into natural language."""
         if not rows:
             return "No results found."
 
@@ -58,46 +60,56 @@ Sample Data (first rows):
 {stats}
 
 Write a clear, 2–3 line business summary.
-Example format:
-- If user asked about an item or customer, mention that directly.
-- Describe patterns, unique values, and counts if relevant.
-- Use human-friendly language.
-
-Summary:
 """
         try:
-            summary = await self.llm_provider.generate_response(prompt)
-            return summary.strip()
+            logger.info(f"[Summarizer] Generating result summary for session={self.session_id}")
+            summary = await asyncio.wait_for(self.llm_provider.generate_response(prompt), timeout=20)
+            return (summary or "").strip()
+        except asyncio.TimeoutError:
+            logger.warning(f"[Summarizer]  Summarize timeout for session={self.session_id}")
+            return f" Query executed successfully with {total_rows} rows."
         except Exception as e:
-            logger.error(f"Summarize error: {e}")
-            return f"Query returned {total_rows} rows."
+            logger.error(f"[Summarizer] Summarize error: {e}")
+            return f" Query executed successfully with {total_rows} rows."
 
- 
-    #  Conversational Reply Generator
-
+   
+    #  Conversational Chat Reply (non-SQL)
+  
     async def generate_chat_reply(self, user_input: str) -> str:
-        """Generate conversational (non-SQL) reply."""
+        """Generate friendly conversational (non-SQL) reply."""
         prompt = f"""
-You are a friendly AI assistant that helps users query a PostgreSQL database.
-Respond to this message naturally, as if you are chatting:
+You are a friendly AI assistant that helps users explore a PostgreSQL database.
+Respond naturally and conversationally to the following:
 "{user_input}"
 """
         try:
-            return await self.llm_provider.generate_response(prompt)
+            logger.info(f"[Summarizer] Generating chat reply for session={self.session_id}")
+
+            # Timeout protection
+            reply = await asyncio.wait_for(self.llm_provider.generate_response(prompt), timeout=10)
+
+            if not reply or not isinstance(reply, str) or reply.strip() == "":
+                return "Hey there! How can I assist you with your data today?"
+            return reply.strip()
+
+        except asyncio.TimeoutError:
+            logger.warning(f"[Summarizer]  Chat reply timed out for session={self.session_id}")
+            return "Hey there ! How can I assist you with your data today?"
         except Exception as e:
-            logger.error(f"Chat reply generation failed: {e}")
-            return "I'm here to help you explore your data. Could you clarify your question?"
+            logger.error(f"[Summarizer] Chat reply generation failed: {e}")
+            return "Hey there! How can I assist you with your data today?"
 
-# Memory / History Summarization
-
+   
+    #  Memory / History Summarization
+  
     async def summarize_texts(self, texts: List[str]) -> str:
-        """Summarize chat messages into a short memory summary."""
+        """Summarize chat history into short memory summary."""
         if not texts:
             return ""
         combined_text = "\n".join(texts)
         prompt = f"""
-Summarize the following chat or conversation into a short, 2–3 line memory summary.
-Focus on what the user wanted, what the AI answered, and main context.
+Summarize this chat conversation in 2–3 lines.
+Focus on what the user asked, what the AI answered, and context.
 
 Conversation:
 {combined_text}
@@ -105,15 +117,19 @@ Conversation:
 Summary:
 """
         try:
-            summary = await self.llm_provider.generate_response(prompt)
-            return summary.strip()
+            summary = await asyncio.wait_for(self.llm_provider.generate_response(prompt), timeout=15)
+            return (summary or "").strip()
+        except asyncio.TimeoutError:
+            logger.warning(f"[Summarizer] summarize_texts timeout for session={self.session_id}")
+            return ""
         except Exception as e:
-            logger.error(f"summarize_texts() failed: {e}")
+            logger.error(f"[Summarizer] summarize_texts() failed: {e}")
             return ""
 
+    #  Basic Stats Helper
 
     def _calculate_stats(self, columns, rows):
-        """Basic stats to enrich summaries."""
+        """Basic statistics to enrich summaries."""
         if not rows:
             return ""
         text = "\nBasic statistics:\n"

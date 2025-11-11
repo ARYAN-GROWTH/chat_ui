@@ -34,7 +34,7 @@ class LLMProvider:
                 temperature=0.0,
             )
 
-            # ✅ access message content directly (no .get)
+            # access message content directly (no .get)
             content = response.choices[0].message.content  # type: ignore
             return (content or "").strip()
 
@@ -57,7 +57,7 @@ class LLMProvider:
             )
 
             async for chunk in stream:
-                # ✅ each chunk contains delta with .content
+                # each chunk contains delta with .content
                 delta = chunk.choices[0].delta  # type: ignore
                 text_piece = getattr(delta, "content", None)
                 if text_piece:

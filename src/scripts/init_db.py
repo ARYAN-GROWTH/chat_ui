@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+
 import asyncio
 from sqlalchemy import text
 from src.db.connection import engine

@@ -4,6 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from contextlib import asynccontextmanager
 from fastapi.openapi.utils import get_openapi
+from src.api.endpoints import router as rest_router
 
 from src.core.config import settings
 from src.core.logging import get_logger
@@ -75,6 +76,7 @@ app.add_middleware(SessionMiddleware)
 #  Routers (REST + WebSocket)
 
 app.include_router(websocket_router)
+app.include_router(rest_router)  
 
 
 #  Custom OpenAPI Docs
