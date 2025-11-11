@@ -1,0 +1,45 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+venv/
+env/
+.venv/
+
+# Docker files
+Dockerfile
+docker-compose.yml
+
+# Git
+.git/
+.gitignore
+
+# Logs & temp files
+*.log
+*.tmp
+*.sqlite
+*.db
+
+# IDE files
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+
+# Notebooks
+*.ipynb
+
+# Build directories
+dist/
+build/
+
+# Test artifacts
+.coverage
+pytest_cache/
+
+# Ignore local environment files (keep secrets out)
+.env
