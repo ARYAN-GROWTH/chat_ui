@@ -367,7 +367,7 @@ async def ws_query(ws: WebSocket):
                 continue
 
             if question.lower() in GREETINGS:
-                await ws.send_json({"type": "answer", "markdown": " Hello! How can I help?"})
+                await ws.send_json({"type": "answer", "message": " Hello! How can I help?"})
                 continue
 
             await ws.send_json({"type": "status", "message": "Working..."})
@@ -378,7 +378,7 @@ async def ws_query(ws: WebSocket):
             await ws.send_json({"type": "status", "message": f"Fetched {len(rows)} rows"})
 
             answer = await generate_answer(question, sql, rows)
-            await ws.send_json({"type": "answer", "markdown": answer})
+            await ws.send_json({"type": "answer", "message": answer})
 
             if rows:
                 filename = f"query_{uuid.uuid4().hex[:6]}.xlsx"
