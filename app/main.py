@@ -43,7 +43,7 @@ console_handler.setFormatter(logging.Formatter(
 logger.addHandler(file_handler)
 logger.addHandler(console_handler)
 
-logger.info("🚀 Server Booting...")
+logger.info(" Server Booting...")
 
 
 
