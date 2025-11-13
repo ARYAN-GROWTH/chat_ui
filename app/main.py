@@ -1,171 +1,193 @@
-# diamond_backend_final.py
 import os
 import re
 import json
 import time
 import uuid
-import math
 import asyncio
 import datetime
 from typing import Any, Dict, List, Optional
-
+from openpyxl.worksheet.worksheet import Worksheet
+from typing import cast
 import asyncpg
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from fastapi.responses import JSONResponse
+from fastapi.exceptions import RequestValidationError
 from dotenv import load_dotenv
-
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.worksheet import Worksheet
-
-# LangChain LLM (only LLM; no embeddings used)
 from langchain_openai import ChatOpenAI
+import logging
+from logging.handlers import RotatingFileHandler
 
-# ----------------------------
-# Config / env
-# ----------------------------
+
+
+LOG_DIR = "logs"
+os.makedirs(LOG_DIR, exist_ok=True)
+
+logger = logging.getLogger("diamond-ai")
+logger.setLevel(logging.INFO)
+
+file_handler = RotatingFileHandler(f"{LOG_DIR}/server.log", maxBytes=5_000_000, backupCount=5)
+file_handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
+
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(logging.Formatter(
+    "%(asctime)s | %(levelname)s | %(message)s"
+))
+
+
+logger.addHandler(file_handler)
+logger.addHandler(console_handler)
+
+logger.info("🚀 Server Booting...")
+
+
+
 load_dotenv()
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-if not OPENAI_API_KEY:
-    raise RuntimeError("OPENAI_API_KEY missing in environment")
+def env(key: str):
+    val = os.getenv(key)
+    if not val:
+        logger.error(f"Missing environment variable: {key}")
+        raise RuntimeError(f"{key} missing")
+    return val
 
-DATABASE_URL_ASYNC = os.getenv(
-    "DATABASE_URL_ASYNC",
-    "postgresql://diamond_user:StrongPassword123!@postgres-db-16-3-r1.cimgrjr0vadx.ap-south-1.rds.amazonaws.com:5432/diamond-db-dev"
-)
+OPENAI_API_KEY = env("OPENAI_API_KEY")
+DATABASE_URL_ASYNC = env("DATABASE_URL_ASYNC")
 
 SCHEMA = os.getenv("SCHEMA", "public")
 TABLE_NAME = os.getenv("TABLE_NAME", "dev_diamond2")
 
-SCHEMA_CACHE_TTL = int(os.getenv("SCHEMA_CACHE_TTL", "600"))
-LAST_N_MEMORY = int(os.getenv("LAST_N_MEMORY", "3"))  # user chose 3
-CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "50"))
+SCHEMA_CACHE_TTL = int(os.getenv("SCHEMA_CACHE_TTL", 600))
+LAST_N_MEMORY = int(os.getenv("LAST_N_MEMORY", 3))
 
-# Where generated files are saved. This will be served at /downloads/<file>
+SQL_MODEL_NAME = os.getenv("SQL_MODEL_NAME", "gpt-4.1-mini")
+ANSWER_MODEL_NAME = os.getenv("ANSWER_MODEL_NAME", "gpt-4o-mini")
+
 USER_HOME = os.path.expanduser("~")
 DOWNLOAD_DIR = os.path.join(USER_HOME, "Downloads", "download")
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-# Also allow local dumps folder as fallback (not necessary but handy)
 DUMPS_DIR = os.path.join(os.getcwd(), "dumps")
 os.makedirs(DUMPS_DIR, exist_ok=True)
 
-# ----------------------------
-# FastAPI app
-# ----------------------------
-app = FastAPI(title="Diamond DB AI — Minimal Events (final)")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-# Serve downloads so browser can GET and trigger "Save as..." to user's Downloads
+app = FastAPI(title="Diamond DB AI Backend — Final")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"]
+)
+
 app.mount("/downloads", StaticFiles(directory=DOWNLOAD_DIR), name="downloads")
 
-# ----------------------------
-# Pools / cache / memory
-# ----------------------------
+
+
+@app.exception_handler(Exception)
+async def global_handler(request, exc):
+    logger.exception(f" Unhandled Error: {exc}")
+    return JSONResponse({"error": "Internal Server Error"}, status_code=500)
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_handler(request, exc):
+    logger.error(f"Validation Error: {exc}")
+    return JSONResponse({"error": "Invalid Input"}, status_code=422)
+
+
 _pg_pool: Optional[asyncpg.pool.Pool] = None
 _schema_cache: Dict[str, Any] = {"value": None, "expires_at": 0}
-
-# session-scoped in-memory text memory
-# session_memory[session_id] = [ {"q": "...", "a": "..."}, ... ]
 session_memory: Dict[str, List[Dict[str, Any]]] = {}
 session_lock = asyncio.Lock()
 
-# ----------------------------
-# LLM models
-# ----------------------------
-SQL_MODEL = ChatOpenAI(model=os.getenv("SQL_MODEL_NAME", "gpt-4.1-mini"), temperature=0)
-ANSWER_MODEL = ChatOpenAI(model=os.getenv("ANSWER_MODEL_NAME", "gpt-4o-mini"), temperature=0)
 
-# ----------------------------
-# Utilities
-# ----------------------------
+
+SQL_MODEL = ChatOpenAI(model=SQL_MODEL_NAME, temperature=0)
+ANSWER_MODEL = ChatOpenAI(model=ANSWER_MODEL_NAME, temperature=0)
+
 def safe_to_text(resp: Any) -> str:
-    """Turn LLM response or mixed object into a plain text string."""
-    if resp is None:
+    try:
+        if resp is None:
+            return ""
+        if isinstance(resp, str):
+            return resp
+        if isinstance(resp, list):
+            return " ".join(safe_to_text(x) for x in resp)
+        if isinstance(resp, dict):
+            return str(resp.get("content") or "")
+        return str(resp)
+    except Exception:
         return ""
-    if isinstance(resp, str):
-        return resp
-    if isinstance(resp, list):
-        return " ".join(safe_to_text(x) for x in resp)
-    if isinstance(resp, dict):
-        if "content" in resp:
-            return str(resp["content"])
-        return " ".join(str(v) for v in resp.values())
-    if hasattr(resp, "content"):
-        try:
-            return str(resp.content)
-        except Exception:
-            return str(resp)
-    return str(resp)
 
-def serialize_value(v: Any) -> Any:
-    if v is None:
-        return None
-    if isinstance(v, (datetime.date, datetime.datetime)):
-        return v.isoformat()
-    return v
 
-def serialize_row(row: Dict[str, Any]) -> Dict[str, Any]:
+def serialize_value(val):
+    if isinstance(val, datetime.datetime):
+        return val.isoformat()
+    if isinstance(val, datetime.date):
+        return val.isoformat()
+    return val
+
+
+def serialize_row(row: Dict[str, Any]):
     return {k: serialize_value(v) for k, v in row.items()}
 
-# ----------------------------
-# DB helpers
-# ----------------------------
-async def get_pg_pool() -> asyncpg.pool.Pool:
+
+
+async def get_pg_pool():
     global _pg_pool
     if _pg_pool is None:
+        logger.info("🔌 Creating PostgreSQL Pool...")
         _pg_pool = await asyncpg.create_pool(DATABASE_URL_ASYNC, min_size=1, max_size=10)
     return _pg_pool
 
-async def get_schema() -> List[Dict[str, Any]]:
+
+async def get_schema():
     now = time.time()
     if _schema_cache["value"] and _schema_cache["expires_at"] > now:
         return _schema_cache["value"]
+
     pool = await get_pg_pool()
+
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             """
             SELECT column_name, data_type
             FROM information_schema.columns
-            WHERE table_schema = $1 AND table_name = $2
+            WHERE table_schema=$1 AND table_name=$2
             ORDER BY ordinal_position
             """,
             SCHEMA, TABLE_NAME
         )
-    cols = [dict(r) for r in rows]
-    _schema_cache["value"] = cols
-    _schema_cache["expires_at"] = now + SCHEMA_CACHE_TTL
-    return cols
 
-# ----------------------------
-# Fallback intent detection
-# ----------------------------
-def detect_intent_fallback(question: str, schema_cols: List[Dict[str, Any]]) -> Optional[str]:
-    q = (question or "").lower().strip()
-    if not q:
-        return None
-    if "database" in q or "table" in q or "columns" in q or "schema" in q:
-        # return quick summary query
-        cols = [c["column_name"] for c in schema_cols]
-        col_list = ", ".join(f'"{c}"' for c in cols[:20])  # limit large list
-        return f"SELECT {col_list} FROM public.{TABLE_NAME} LIMIT 1"
-    if "main category" in q or q in {"main_category", "main category"}:
-        return f'SELECT DISTINCT "main_category" FROM public.{TABLE_NAME} LIMIT 200'
+    columns = [dict(r) for r in rows]
+    _schema_cache.update({"value": columns, "expires_at": now + SCHEMA_CACHE_TTL})
+
+    return columns
+
+
+def detect_intent_fallback(question: str, schema_cols: List[Dict[str, Any]]):
+    q = question.lower()
+
+    if "database" in q or "columns" in q:
+        cols = ", ".join(f"\"{c['column_name']}\"" for c in schema_cols[:20])
+        return f"SELECT {cols} FROM {SCHEMA}.{TABLE_NAME} LIMIT 1"
+
+    if "main category" in q:
+        return f"SELECT DISTINCT \"main_category\" FROM {SCHEMA}.{TABLE_NAME} LIMIT 200"
+
     if "subcategory" in q:
-        return f'SELECT DISTINCT "subcategory" FROM public.{TABLE_NAME} LIMIT 200'
-    # item_no pattern
-    m = re.search(r'([0-9A-Za-z\-_.]+)', question)
-    if "item_no" in q or "item no" in q or (m and "-" in (m.group(1) or "")):
-        # Try to extract token that looks like code (keep flexible). Let LLM refine
-        return None
+        return f"SELECT DISTINCT \"subcategory\" FROM {SCHEMA}.{TABLE_NAME} LIMIT 200"
+
     return None
 
-# ----------------------------
-# SQL sanitizer
-# ----------------------------
+
+
 SQL_PROMPT_TEMPLATE = """
 You are an expert PostgreSQL assistant.
 Return ONE valid PostgreSQL SELECT statement only (no explanation).
@@ -184,81 +206,59 @@ Rules:
 - Return ONLY the SQL statement.
 """
 
-def sanitize_sql(raw: Any) -> str:
-    txt = safe_to_text(raw).strip()
-    # remove potential prefix content=...
-    txt = re.sub(r"^\s*content\s*[:=]\s*", "", txt, flags=re.I)
-    # remove code fences
-    txt = re.sub(r"```(?:sql)?", "", txt, flags=re.I).replace("```", "")
-    txt = txt.replace("`", "")
-    # unescape
-    txt = txt.replace("\\n", " ").replace("\\r", " ").replace("\\t", " ")
-    txt = txt.replace("\\'", "'").replace('\\"', '"').replace("\\\\", "\\")
-    m = re.search(r"(select\b[\s\S]*?)(?:;|$)", txt, flags=re.I)
-    if not m:
-        raise ValueError("No SELECT found in LLM output.")
-    sql = m.group(1).strip()
-    sql = sql.split(";")[0].strip()
-    return sql
 
-# ----------------------------
-# SQL generation (uses text history last N)
-# ----------------------------
+def sanitize_sql(raw: str):
+    txt = raw.strip().replace("```sql", "").replace("```", "")
+    m = re.search(r"(select[\s\S]*?)(;|$)", txt, flags=re.I)
+    if not m:
+        raise ValueError("No SELECT found.")
+    return m.group(1).strip()
+
+
+
 async def generate_sql(session_id: str, question: str) -> str:
-    schema_cols = await get_schema()
-    async with session_lock:
-        mem = session_memory.get(session_id, [])  # full session memory
-    # build last N pairs
-    last_pairs = mem[-LAST_N_MEMORY:] if mem else []
-    mem_text = " ; ".join(f"Q: {p.get('q','')} A: {p.get('a','')}" for p in last_pairs)
+    try:
+        schema_cols = await get_schema()
+    except:
+        return "SELECT 1"
+
     fallback = detect_intent_fallback(question, schema_cols)
     if fallback:
         return fallback
-    columns = ", ".join(c["column_name"] for c in schema_cols)
+
+    async with session_lock:
+        mem = session_memory.get(session_id, [])
+
+    memory_text = "; ".join(f"Q:{p['q']} A:{p['a']}" for p in mem[-LAST_N_MEMORY:])
+
     prompt = SQL_PROMPT_TEMPLATE.format(
         schema=SCHEMA,
         table=TABLE_NAME,
-        columns=columns,
-        memory=mem_text,
+        columns=", ".join(c["column_name"] for c in schema_cols),
+        memory=memory_text,
         question=question
     )
-    resp = await asyncio.to_thread(SQL_MODEL.invoke, prompt)
-    sql_raw = safe_to_text(resp)
-    sql = sanitize_sql(sql_raw)
-    # Ensure read-only
-    if not sql.lower().startswith("select"):
-        raise ValueError("LLM did not produce a SELECT statement.")
-    # Do NOT force LIMIT for item_no: user wanted all rows matching item_no
-    return sql
 
-# ----------------------------
-# Exec SQL with retry
-# ----------------------------
-async def exec_sql(sql: str) -> List[Dict[str, Any]]:
-    low = sql.lower()
-    forbidden = ["insert ", "update ", "delete ", "drop ", "alter ", "create ", "truncate "]
-    if any(f in low for f in forbidden):
-        raise ValueError("Only SELECT statements allowed.")
+    try:
+        resp = await asyncio.to_thread(SQL_MODEL.invoke, prompt)
+        return sanitize_sql(safe_to_text(resp))
+    except:
+        return "SELECT 1"
+
+
+
+async def exec_sql(sql: str):
     pool = await get_pg_pool()
     try:
         async with pool.acquire() as conn:
-            await conn.reset()
-            await conn.execute("SET statement_timeout='10000';")
+            await conn.execute("SET statement_timeout='10000'")
             rows = await conn.fetch(sql)
-    except Exception:
-        # retry once
-        new_conn = await pool.acquire()
-        try:
-            await new_conn.reset()
-            await new_conn.execute("SET statement_timeout='10000';")
-            rows = await new_conn.fetch(sql)
-        finally:
-            await pool.release(new_conn)
-    return [dict(r) for r in rows]
+            return [dict(r) for r in rows]
+    except:
+        return []
 
-# ----------------------------
-# Answer generation (short)
-# ----------------------------
+
+
 ANSWER_PROMPT = """
 Summarize SQL results concisely.
 
@@ -272,207 +272,157 @@ Rows (sample up to 10): {rows}
 Return only Markdown.
 """
 
-async def generate_answer(question: str, sql: str, rows: List[Dict[str, Any]]) -> str:
+
+
+async def generate_answer(question, sql, rows):
     prompt = ANSWER_PROMPT.format(
         question=question,
         sql=sql,
         rows=json.dumps(rows[:10], default=str)
     )
-    resp = await asyncio.to_thread(ANSWER_MODEL.invoke, prompt)
-    return safe_to_text(resp).strip()
 
-# ----------------------------
-# Date parsing for excel
-# ----------------------------
-def try_parse_date(value: Any) -> Optional[datetime.date]:
-    if value is None:
-        return None
-    if isinstance(value, (datetime.date, datetime.datetime)):
-        return value.date() if isinstance(value, datetime.datetime) else value
-    s = str(value).strip()
-    if not s:
-        return None
-    formats = [
-        "%d-%b-%y", "%d-%b-%Y",
-        "%d-%B-%y", "%d-%B-%Y",
-        "%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y",
-        "%d %b %y", "%d %b %Y", "%d %B %Y", "%d %B %y"
-    ]
-    for fmt in formats:
-        try:
-            dt = datetime.datetime.strptime(s, fmt)
-            return dt.date()
-        except Exception:
-            pass
-    # remove st/nd/rd/th
-    s2 = re.sub(r'(\d+)(st|nd|rd|th)', r'\1', s, flags=re.I)
-    for fmt in formats:
-        try:
-            dt = datetime.datetime.strptime(s2, fmt)
-            return dt.date()
-        except Exception:
-            pass
+    try:
+        resp = await asyncio.to_thread(ANSWER_MODEL.invoke, prompt)
+        return safe_to_text(resp)
+    except:
+        return "Could not generate answer."
+
+
+
+def try_parse_date(value):
+    if isinstance(value, datetime.datetime):
+        return value.date()
+    if isinstance(value, datetime.date):
+        return value
     return None
 
-# ----------------------------
-# Excel writer with styling & preview
-# ----------------------------
-def write_styled_excel_and_preview(rows: List[Dict[str, Any]], filename: str, preview_count: int = 8) -> Dict[str, Any]:
-    filepath = os.path.join(DOWNLOAD_DIR, filename)
-    wb = Workbook()
-    sheet: Worksheet = wb.active  # type: ignore[assignment]
-    sheet.title = "Results"
-    if not rows:
-        wb.save(filepath)
-        return {"filename": filename, "preview_rows": []}
-    headers = list(rows[0].keys())
-    # header styling
-    for col_idx, header in enumerate(headers, start=1):
-        cell = sheet.cell(row=1, column=col_idx, value=header)
-        cell.font = Font(bold=True, color="FFFFFF")
-        cell.fill = PatternFill(fill_type="solid", fgColor="1E4F9C")
-        cell.alignment = Alignment(horizontal="center", vertical="center")
-    # Write data rows
-    for r_idx, row in enumerate(rows, start=2):
-        for c_idx, header in enumerate(headers, start=1):
-            raw_val = row.get(header, "")
-            parsed_date = try_parse_date(raw_val)
-            if parsed_date:
-                sheet.cell(row=r_idx, column=c_idx, value=parsed_date)
-            else:
-                sheet.cell(row=r_idx, column=c_idx, value=raw_val)
-    # Auto column width
-    for col_idx in range(1, len(headers) + 1):
-        max_len = 0
-        for row_tuple in sheet.iter_rows(min_row=1, min_col=col_idx, max_col=col_idx):
-            cell = row_tuple[0]
-            try:
-                if cell.value is not None:
-                    max_len = max(max_len, len(str(cell.value)))
-            except Exception:
-                pass
-        sheet.column_dimensions[get_column_letter(col_idx)].width = max(max_len + 4, 10)
-    wb.save(filepath)
-    preview_rows = [serialize_row(r) for r in rows[:preview_count]]
-    return {"filename": filename, "preview_rows": preview_rows}
 
-# ----------------------------
-# WebSocket endpoint (minimal events)
-# ----------------------------
-GREETINGS = {"hello", "hi", "hey", "hola", "namaste", "hlo", "how are you", "how r you"}
+def write_styled_excel_and_preview(rows, filename):
+    file_path = os.path.join(DOWNLOAD_DIR, filename)
+
+    wb = Workbook()
+    
+
+    sheet = cast(Worksheet, wb.active)
+    sheet.title = "Results"
+
+    if rows:
+        headers = list(rows[0].keys())
+
+        # Header
+        for idx, h in enumerate(headers, 1):
+            c = sheet.cell(row=1, column=idx, value=h)
+            c.font = Font(bold=True, color="FFFFFF")
+            c.fill = PatternFill("solid", fgColor="1E4F9C")
+            c.alignment = Alignment(horizontal="center")
+
+        # Data
+        for r_i, row in enumerate(rows, start=2):
+            for c_i, h in enumerate(headers, start=1):
+                v = row.get(h)
+                d = try_parse_date(v)
+                sheet.cell(row=r_i, column=c_i, value=d if d else v)
+
+        # Auto-width
+        for col_i in range(1, len(headers) + 1):
+            max_len = 10
+            for cell in sheet[get_column_letter(col_i)]:
+                if cell.value:
+                    max_len = max(max_len, len(str(cell.value)))
+            sheet.column_dimensions[get_column_letter(col_i)].width = max_len + 4
+
+    wb.save(file_path)
+
+    return {
+        "filename": filename,
+        "preview_rows": [serialize_row(r) for r in rows[:8]]
+    }
+
+
+
+GREETINGS = {"hello", "hi", "hey", "hola", "namaste", "hlo"}
 
 @app.websocket("/ws/query")
 async def ws_query(ws: WebSocket):
-    # Create unique session for connection
+    await ws.accept()
     session_id = uuid.uuid4().hex
+    logger.info(f" Client Connected: {session_id}")
+
     async with session_lock:
         session_memory[session_id] = []
-    await ws.accept()
+
     try:
         while True:
             raw = await ws.receive_text()
+
             try:
                 payload = json.loads(raw)
-            except Exception:
-                await ws.send_json({"type": "status", "message": "Invalid JSON payload"})
+            except:
+                await ws.send_json({"type": "status", "message": "Invalid JSON"})
                 continue
 
-            question = safe_to_text(payload.get("question") or "").strip()
+            question = safe_to_text(payload.get("question", ""))
             if not question:
-                await ws.send_json({"type": "status", "message": "Please send a non-empty question."})
+                await ws.send_json({"type": "status", "message": "Ask a valid question"})
                 continue
 
-            # Greeting quick reply (no memory, no SQL)
             if question.lower() in GREETINGS:
-                await ws.send_json({"type": "status", "message": "Quick reply..."})
-                await ws.send_json({"type": "answer", "markdown": "👋 Hello! How can I help you explore the Diamond database?"})
+                await ws.send_json({"type": "answer", "markdown": " Hello! How can I help?"})
                 continue
 
-            # Status
-            await ws.send_json({"type": "status", "message": "Working on your request..."})
+            await ws.send_json({"type": "status", "message": "Working..."})
 
-            # Generate SQL (fallback or LLM)
-            try:
-                sql = await generate_sql(session_id, question)
-            except Exception as e:
-                await ws.send_json({"type": "answer", "markdown": f"❗ Could not form SQL: {str(e)}"})
-                continue
+            sql = await generate_sql(session_id, question)
+            rows = await exec_sql(sql)
 
-            # Execute SQL
-            try:
-                rows = await exec_sql(sql)
-            except Exception as e:
-                await ws.send_json({"type": "answer", "markdown": f"❗ Database error: {str(e)}"})
-                continue
+            await ws.send_json({"type": "status", "message": f"Fetched {len(rows)} rows"})
 
-            # DO NOT send internal stream objects to frontend.
-            # Instead, inform about number of rows (status), then send final answer and file info.
-            await ws.send_json({"type": "status", "message": f"Fetched {len(rows)} rows."})
+            answer = await generate_answer(question, sql, rows)
+            await ws.send_json({"type": "answer", "markdown": answer})
 
-            # Prepare answer
-            await ws.send_json({"type": "status", "message": "Preparing final answer..."})
-            try:
-                answer_md = await generate_answer(question, sql, rows)
-            except Exception as e:
-                answer_md = f"❗ Could not generate answer: {str(e)}"
-
-            # Send the final answer
-            await ws.send_json({"type": "answer", "markdown": answer_md})
-
-            # Save excel and send file + preview (if rows exist)
             if rows:
-                filename = f"query_{uuid.uuid4().hex[:8]}.xlsx"
-                loop = asyncio.get_event_loop()
+                filename = f"query_{uuid.uuid4().hex[:6]}.xlsx"
                 try:
-                    res = await loop.run_in_executor(None, lambda: write_styled_excel_and_preview(rows, filename))
-                    await ws.send_json({"type": "file", "filename": res["filename"], "url": f"/downloads/{res['filename']}"})
-                    await ws.send_json({"type": "file_preview", "file": res["filename"], "preview_rows": res["preview_rows"]})
+                    res = write_styled_excel_and_preview(rows, filename)
+                    await ws.send_json({
+                        "type": "file",
+                        "filename": filename,
+                        "url": f"/downloads/{filename}"
+                    })
+                    await ws.send_json({
+                        "type": "file_preview",
+                        "preview_rows": res["preview_rows"]
+                    })
                 except Exception as e:
-                    await ws.send_json({"type": "status", "message": f"Could not write file: {str(e)}"})
+                    logger.error(f"Excel error: {e}")
 
-            # Persist memory: store Q/A pair in session memory (last N)
-            try:
-                async with session_lock:
-                    session_memory.setdefault(session_id, []).append({"q": question, "a": answer_md})
-                    # trim to last N
-                    session_memory[session_id] = session_memory[session_id][-LAST_N_MEMORY:]
-            except Exception:
-                pass
+            # Save memory
+            async with session_lock:
+                session_memory[session_id].append({"q": question, "a": answer})
+                session_memory[session_id] = session_memory[session_id][-LAST_N_MEMORY:]
 
     except WebSocketDisconnect:
-        # On disconnect, clear session memory
+        logger.info(f" Client Disconnected: {session_id}")
         async with session_lock:
-            try:
-                if session_id in session_memory:
-                    del session_memory[session_id]
-            except Exception:
-                pass
-        return
+            session_memory.pop(session_id, None)
 
-# ----------------------------
-# Root + startup
-# ----------------------------
+
+
 @app.get("/")
 async def root():
-    return {"status": "ok", "msg": "Diamond DB AI — Minimal Events backend running"}
+    return {"status": "ok", "msg": "Diamond AI Backend Running"}
+
 
 @app.on_event("startup")
-async def on_startup():
-    try:
-        await get_pg_pool()
-    except Exception:
-        pass
-    try:
-        await get_schema()
-    except Exception:
-        pass
+async def startup():
+    logger.info(" Server Started")
+
 
 @app.on_event("shutdown")
-async def on_shutdown():
+async def shutdown():
+    logger.info(" Server Shutdown Started")
     global _pg_pool
     if _pg_pool:
-        try:
-            await _pg_pool.close()
-        except Exception:
-            pass
+        await _pg_pool.close()
+        logger.info(" PostgreSQL Pool Closed")
         _pg_pool = None
