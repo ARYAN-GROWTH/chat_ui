@@ -17,4 +17,4 @@ COPY . .
 EXPOSE 8001
 
 # Default command to run server
-CMD ["uvicorn", "src.main:app", "--reload", "--host", "0.0.0.0", "--port", "8001"]
+CMD ["uvicorn", "app.main:app", "--reload", "--host", "0.0.0.0", "--port", "8001"]
