@@ -3,136 +3,196 @@
 <head>
 <meta charset="UTF-8" />
 <title>Diamond AI – Query Console</title>
+
 <style>
     body {
-        background: #f5f7fa;
-        font-family: Arial, sans-serif;
-        padding: 20px;
+        background: #f2f5f9;
+        font-family: "Inter", Arial, sans-serif;
+        padding: 0;
+        margin: 0;
+        display: flex;
+        flex-direction: column;
+        height: 100vh;
     }
+
+    header {
+        padding: 15px 25px;
+        background: white;
+        font-size: 20px;
+        font-weight: 700;
+        border-bottom: 1px solid #ddd;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+    }
+
     #chatWindow {
-        height: 60vh;
+        flex: 1;
         overflow-y: auto;
-        background: #fff;
-        padding: 15px;
-        border-radius: 10px;
-        border: 1px solid #ddd;
-        box-shadow: 0 2px 8px rgba(0,0,0,0.05);
+        padding: 25px;
+        background: #f7f9fc;
     }
+
     .msg {
-        margin: 10px 0;
-        padding: 10px 14px;
-        border-radius: 8px;
-        max-width: 70%;
+        margin: 14px 0;
+        padding: 12px 16px;
+        border-radius: 12px;
+        max-width: 75%;
         white-space: pre-wrap;
+        line-height: 1.4;
+        font-size: 15px;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.05);
     }
+
     .user {
-        background: #0b74ff;
-        color: #fff;
+        background: #0078ff;
+        color: white;
         margin-left: auto;
+        border-bottom-right-radius: 2px;
     }
+
     .bot {
-        background: #e9ecef;
-        color: #000;
+        background: white;
+        color: #222;
         margin-right: auto;
+        border-bottom-left-radius: 2px;
+        border: 1px solid #e2e2e2;
     }
+
     #inputArea {
-        margin-top: 15px;
+        padding: 15px;
+        background: white;
         display: flex;
         gap: 10px;
+        border-top: 1px solid #ddd;
     }
+
     #userInput {
         flex: 1;
         padding: 12px;
+        border-radius: 10px;
         border: 1px solid #ccc;
-        border-radius: 8px;
+        outline: none;
         font-size: 15px;
     }
+
     #sendBtn {
-        padding: 12px 20px;
-        background: #0b74ff;
+        padding: 12px 22px;
+        background: #0078ff;
         border: none;
-        border-radius: 8px;
+        border-radius: 10px;
         color: white;
         cursor: pointer;
+        font-size: 15px;
+        font-weight: 600;
     }
+
+    #sendBtn:hover {
+        background: #005fcc;
+    }
+
     #previewBox {
         display: none;
-        margin-top: 20px;
-        background: #fff;
+        background: white;
         padding: 15px;
-        border-radius: 8px;
+        border-radius: 10px;
         border: 1px solid #ddd;
-        max-height: 260px;
-        overflow-y: auto;
+        margin: 15px;
     }
+
     table {
         border-collapse: collapse;
         width: 100%;
         font-size: 13px;
     }
+
     th, td {
         border: 1px solid #ccc;
         padding: 6px 8px;
     }
+
     th {
         background: #f0f0f0;
         font-weight: bold;
     }
+
+    #directDownloadBtn {
+        padding: 10px 18px;
+        background: #00a36f;
+        border: none;
+        border-radius: 8px;
+        color: white;
+        font-size: 14px;
+        cursor: pointer;
+        margin-bottom: 10px;
+    }
+
+    #directDownloadBtn:hover {
+        background: #008a5d;
+    }
 </style>
 
-<!-- Markdown Renderer -->
 <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
-
 </head>
+
 <body>
 
-<h2>Diamond AI — Database Assistant</h2>
+<header>Diamond AI — Database Assistant</header>
 
 <div id="chatWindow"></div>
 
-<div id="inputArea">
-    <input id="userInput" placeholder="Ask something about the Diamond DB...">
-    <button id="sendBtn">Send</button>
+<div id="previewBox">
+    <button id="directDownloadBtn">Download File</button>
+    <div id="previewTable"></div>
 </div>
 
-<div id="previewBox">
-    <h3> Excel Preview</h3>
-    <div id="downloadLink"></div>
-    <div id="previewTable"></div>
+<div id="inputArea">
+    <input id="userInput" placeholder="Ask anything about Diamond DB…">
+    <button id="sendBtn">Send</button>
 </div>
 
 <script>
 const ws = new WebSocket("ws://localhost:8001/ws/query");
 const chat = document.getElementById("chatWindow");
 
-function addMsg(text, cls="bot", isMarkdown=false) {
+function addMsg(text, cls="bot", markdown=false) {
     const el = document.createElement("div");
     el.className = "msg " + cls;
-    el.innerHTML = isMarkdown ? marked.parse(text) : text;
+    el.innerHTML = markdown ? marked.parse(text) : text;
     chat.appendChild(el);
     chat.scrollTop = chat.scrollHeight;
 }
 
-ws.onopen = () => addMsg(" Connected to server", "bot");
-ws.onclose = () => addMsg(" Disconnected", "bot");
-ws.onerror = () => addMsg(" Connection error", "bot");
+ws.onopen = () => addMsg("Connected to server.", "bot");
+ws.onclose = () => addMsg("Disconnected.", "bot");
+ws.onerror = () => addMsg("Connection error occurred.", "bot");
 
 ws.onmessage = (event) => {
     const msg = JSON.parse(event.data);
 
     if (msg.type === "status") {
-        addMsg(" " + msg.message, "bot");
+        addMsg(msg.message, "bot");
     }
+
     else if (msg.type === "answer") {
         addMsg(msg.message, "bot", true);
     }
+
     else if (msg.type === "file") {
-        addMsg(" Excel ready: " + msg.filename, "bot");
-        document.getElementById("downloadLink").innerHTML = `
-            <a href="${msg.url}" target="_blank"> Download Excel</a>
-        `;
+        const fileUrl = msg.url;
+        const fileName = msg.filename;
+
         document.getElementById("previewBox").style.display = "block";
+
+        // Auto-download on button click
+        document.getElementById("directDownloadBtn").onclick = () => {
+            const a = document.createElement("a");
+            a.href = fileUrl;
+            a.download = fileName;
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+        };
     }
+
     else if (msg.type === "file_preview") {
         showPreviewTable(msg.preview_rows);
     }
@@ -141,18 +201,21 @@ ws.onmessage = (event) => {
 function showPreviewTable(rows) {
     const wrap = document.getElementById("previewTable");
     if (!rows || rows.length === 0) {
-        wrap.innerHTML = "<i>No preview available</i>";
+        wrap.innerHTML = "<i>No preview available.</i>";
         return;
     }
+
     const cols = Object.keys(rows[0]);
     let html = "<table><thead><tr>";
-    cols.forEach(col => html += `<th>${col}</th>`);
+    cols.forEach(c => html += `<th>${c}</th>`);
     html += "</tr></thead><tbody>";
+
     rows.forEach(r => {
         html += "<tr>";
         cols.forEach(c => html += `<td>${r[c] ?? ""}</td>`);
         html += "</tr>";
     });
+
     html += "</tbody></table>";
     wrap.innerHTML = html;
 }
@@ -160,6 +223,7 @@ function showPreviewTable(rows) {
 document.getElementById("sendBtn").onclick = () => {
     const text = userInput.value.trim();
     if (!text) return;
+
     addMsg(text, "user");
     ws.send(JSON.stringify({ question: text }));
     userInput.value = "";
